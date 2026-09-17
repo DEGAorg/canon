@@ -195,7 +195,7 @@ def run(
 
 @main.command("acp")
 @click.argument("command", metavar="COMMAND")
-@click.argument("project_dir", metavar="PATH", default=None)
+@click.argument("project_dir", metavar="PATH", default=".")
 @click.option(
     "-t",
     "--title",
@@ -203,7 +203,7 @@ def run(
     help="Optional title to display in the status bar",
     default=None,
 )
-@click.option("-d", "--project-dir", metavar="PATH", default=None)
+@click.option("-d", "--project-dir", "project_dir_option", metavar="PATH", default=None)
 @click.option(
     "-p",
     "--port",
@@ -225,7 +225,8 @@ def acp(
     host: str,
     port: int,
     title: str | None,
-    project_dir: str | None,
+    project_dir: str,
+    project_dir_option: str | None,
     serve: bool = False,
 ) -> None:
     """Run an ACP agent from a command."""
@@ -233,6 +234,10 @@ def acp(
     from rich import print
 
     from toad.agent_schema import Agent as AgentData
+
+    if project_dir_option is not None:
+        project_dir = project_dir_option
+    check_directory(project_dir)
 
     command_name = command.split(" ", 1)[0].lower()
     identity = f"{command_name}.custom.canon.dega.org"
