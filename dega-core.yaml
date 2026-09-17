@@ -1,0 +1,30 @@
+# DEGA Core config — edit to match your project
+version: 1
+provider: github
+max_iterations: 20
+
+budget:
+  warn_at_iteration: 15
+check_command: |
+  pytest -q && ruff check . && ty check
+poll_interval_seconds: 30
+
+# Worker and reviewer prompts (global, installed by /apply-core)
+worker_prompt: ~/.claude/scripts/ralph-worker-prompt.md
+reviewer_prompt: ~/.claude/scripts/ralph-reviewer-prompt.md
+
+github:
+  sync: true
+  repo: DEGAorg/canon
+  labels: true
+  comments: true
+  close_on_ship: false
+  pr_target: canon
+
+timeline:
+  repo: DEGAorg/canon
+
+success_criteria:
+  - "tests pass"
+  - "linting clean"
+  - "types valid"
