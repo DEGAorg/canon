@@ -1,0 +1,12 @@
+[profile.default]
+# Contracts live at the root of this folder (DegaChatRegistry.sol, IERC20.sol);
+# tests are in test/. Run:  forge build && forge test
+src = "."
+out = "out"
+libs = ["lib"]
+solc = "0.8.20"
+# src="." must not discover the dependency's own fixture/fork tests.
+no_match_path = "lib/**"
+
+[fmt]
+line_length = 100

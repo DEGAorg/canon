@@ -1,0 +1,8 @@
+repos:
+  - repo: local
+    hooks:
+      - id: python-syntax
+        name: Check Python syntax
+        entry: python3 -m compileall -q
+        language: system
+        types: [python]

@@ -1,0 +1,490 @@
+"""PlanExecutionModel — watch an orchestrator plan directory.
+
+Reads ``.orchestrator/plans/<slug>/state.json`` plus per-item worker
+log files (``logs/worker-<id>.log`` written by the orchestrator engine
+via ``tmux pipe-pane``; ``logs/<id>.log`` is honoured as a legacy
+fallback) and posts the Textual messages the existing plan-execution
+widgets already handle:
+
+- :class:`toad.widgets.plan_execution_tab.PlanExecutionTab.ItemStatusChanged`
+  whenever an item's ``status`` field flips,
+- :class:`toad.widgets.plan_execution_tab.PlanExecutionTab.PlanFinished`
+  the first time the plan reaches a terminal state — either
+  ``finalReview.result`` becomes ``SHIP``/``REVISE`` or top-level
+  ``status`` becomes ``completed``/``failed``/``aborted``,
+- log chunks delivered through callbacks registered via
+  :meth:`subscribe_log` — the path the
+  :class:`toad.widgets.plan_worker_log_pane.PlanWorkerLogPane` already
+  drives to raise its ``ItemLogAppended`` message.
+
+The model owns no Textual widgets and does no rendering. Construction
+parses ``state.json`` once so callers can introspect ``slug``,
+``issue_number``, ``items``, and ``verdict`` synchronously. After
+:meth:`start`, every call to :meth:`poll_now` rescans the plan
+directory and posts whatever changed.
+
+Polling mode (the default, ``poll=True``) gives tests a deterministic,
+synchronous trigger and avoids spawning a watcher thread. Production
+callers should still use ``poll=True`` and drive :meth:`poll_now` from
+a Textual interval — file watching is intentionally out of scope here.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Protocol
+
+from toad.widgets.plan_dep_graph import DepGraphItem
+from toad.widgets.plan_execution_tab import PlanExecutionTab
+
+
+__all__ = ["PlanExecutionModel", "TerminalInfo"]
+
+
+_TERMINAL_VERDICTS = frozenset({"SHIP", "REVISE"})
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "aborted"})
+_DEFAULT_VERDICT = "running"
+_PHASE_RUNNING = "Running"
+_PHASE_REVIEW = "Review"
+_PHASE_VERIFY = "Verify"
+_PHASE_DONE = "Done"
+_PHASE_FAILED = "Failed"
+
+
+@dataclass(frozen=True)
+class TerminalInfo:
+    """Snapshot of a plan's terminal state — what the panel renders on completion."""
+
+    status: str  # "completed" | "failed" | "aborted"
+    result: str | None  # "SHIP" | "REVISE" | None (engine bailed before review)
+    pr_url: str | None
+    pr_number: int | None
+    verification_status: str | None  # "passed" | "failed" | None
+    verification_unchecked: int
+    items_shipped: int
+    items_reworked: int
+    items_total: int
+    elapsed_seconds: float | None
+    review_iterations: int
+
+
+class _MessageTarget(Protocol):
+    """Slice of ``textual.widget.Widget`` the model needs."""
+
+    def post_message(self, message: Any) -> bool: ...
+
+
+class PlanExecutionModel:
+    """Polls an orchestrator plan directory and posts widget messages."""
+
+    def __init__(
+        self,
+        plan_dir: Path,
+        *,
+        target: _MessageTarget,
+        poll: bool = True,
+    ) -> None:
+        self._plan_dir = Path(plan_dir)
+        self._target = target
+        self._poll_only = poll
+        self._lock = threading.Lock()
+
+        self._slug: str = ""
+        self._issue_number: int | None = None
+        self._items: list[DepGraphItem] = []
+        self._verdict: str = _DEFAULT_VERDICT
+        self._status: str = "running"
+        self._phase: str = _PHASE_RUNNING
+        self._final_review_status: str = "pending"
+        self._terminal: TerminalInfo | None = None
+        self._finished_emitted: bool = False
+        self._started: bool = False
+
+        self._log_positions: dict[int, int] = {}
+        self._log_paths: dict[int, Path] = {}
+        self._log_subscribers: dict[int, list[Callable[[str], None]]] = {}
+
+        self._initial_parse()
+
+    # ------------------------------------------------------------------
+    # Public attributes
+    # ------------------------------------------------------------------
+
+    @property
+    def plan_dir(self) -> Path:
+        return self._plan_dir
+
+    @property
+    def slug(self) -> str:
+        return self._slug
+
+    @property
+    def issue_number(self) -> int | None:
+        return self._issue_number
+
+    @property
+    def items(self) -> list[DepGraphItem]:
+        """Snapshot of plan items in the order ``state.json`` lists them."""
+        return list(self._items)
+
+    @property
+    def verdict(self) -> str:
+        return self._verdict
+
+    @property
+    def status(self) -> str:
+        """Top-level orch status — running / verifying / completed / failed / aborted."""
+        return self._status
+
+    @property
+    def phase(self) -> str:
+        """Human-readable phase label: Running / Review / Verify / Done / Failed."""
+        return self._phase
+
+    @property
+    def terminal(self) -> TerminalInfo | None:
+        """Snapshot of terminal state once the plan has finished. ``None`` while running."""
+        return self._terminal
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def set_target(self, target: _MessageTarget) -> None:
+        """Re-point the message sink. Used when the owning tab is mounted
+        after the model is constructed — the factory creates the model
+        with a placeholder pane target, and ``PlanExecutionSection.open_tab``
+        swaps in the actual tab so ``ItemStatusChanged`` messages reach
+        ``on_plan_execution_tab_item_status_changed``.
+        """
+        self._target = target
+
+    def start(self) -> None:
+        """Mark the model as live; subsequent ``poll_now`` calls emit diffs."""
+        self._started = True
+
+    def stop(self) -> None:
+        """Stop emitting diffs. Idempotent."""
+        self._started = False
+
+    def poll_now(self) -> None:
+        """Synchronous rescan — read ``state.json`` and tail subscribed logs."""
+        self._scan_state()
+        self._scan_logs()
+
+    # ------------------------------------------------------------------
+    # Subscriptions
+    # ------------------------------------------------------------------
+
+    def subscribe_log(
+        self, item_id: int, callback: Callable[[str], None]
+    ) -> Callable[[], None]:
+        """Subscribe ``callback`` to item ``item_id``'s log stream.
+
+        The returned callable removes the subscription. After the last
+        subscriber for an item unsubscribes, the model stops tailing
+        that item's log file until a new subscription arrives.
+        """
+        with self._lock:
+            existing = self._log_subscribers.setdefault(item_id, [])
+            is_first_subscriber = len(existing) == 0
+            existing.append(callback)
+
+        # Replay whatever is already on disk so a fresh subscriber sees
+        # the worker's prior conversation rather than just future diffs.
+        # Without this, navigating away from an item and back wipes the
+        # pane (the widget clears on switch) and the model — which only
+        # tails new bytes — has nothing to re-deliver, so the user loses
+        # the entire run history mid-session and after the worker exits.
+        snapshot = self._read_log_snapshot(item_id)
+        if snapshot:
+            callback(snapshot)
+        if is_first_subscriber:
+            # When the previous subscriber detached, the worker may have
+            # kept writing — leaving ``_log_positions`` lagging behind
+            # the file size. Sync to the snapshot length so the next
+            # ``poll_now`` doesn't re-deliver bytes already in the
+            # snapshot above. Other subscribers, if any, share the same
+            # position, so we only do this on the first attach.
+            log_path = self._resolve_log_path(item_id)
+            if log_path is not None:
+                try:
+                    self._log_positions[item_id] = log_path.stat().st_size
+                    self._log_paths[item_id] = log_path
+                except OSError:
+                    pass
+
+        def _unsubscribe() -> None:
+            with self._lock:
+                subs = self._log_subscribers.get(item_id)
+                if subs is None:
+                    return
+                try:
+                    subs.remove(callback)
+                except ValueError:
+                    pass
+                if not subs:
+                    self._log_subscribers.pop(item_id, None)
+
+        return _unsubscribe
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _initial_parse(self) -> None:
+        payload = self._read_state()
+        if payload is None:
+            return
+        self._slug = str(payload.get("plan", ""))
+        issue = payload.get("issueNumber")
+        self._issue_number = int(issue) if isinstance(issue, int) else None
+        self._items = [self._item_from_dict(it) for it in payload.get("items", [])]
+        self._absorb_state_meta(payload)
+        if self._is_terminal():
+            # Treat plans that are already terminal at construction as
+            # having been announced — we don't replay history.
+            self._terminal = self._build_terminal_info(payload)
+            self._finished_emitted = True
+
+    def _scan_state(self) -> None:
+        payload = self._read_state()
+        if payload is None:
+            return
+        new_items = [self._item_from_dict(it) for it in payload.get("items", [])]
+        old_status: dict[int, str] = {it.id: it.status for it in self._items}
+        for item in new_items:
+            prev = old_status.get(item.id)
+            if prev is not None and prev != item.status:
+                self._target.post_message(
+                    PlanExecutionTab.ItemStatusChanged(item.id, item.status)
+                )
+        self._items = new_items
+        self._absorb_state_meta(payload)
+        if self._is_terminal() and not self._finished_emitted:
+            self._terminal = self._build_terminal_info(payload)
+            self._finished_emitted = True
+            self._target.post_message(
+                PlanExecutionTab.PlanFinished(self._verdict, terminal=self._terminal)
+            )
+
+    def _absorb_state_meta(self, payload: dict[str, Any]) -> None:
+        """Refresh status, finalReview.result, finalReview.status, derived phase."""
+        status = payload.get("status")
+        self._status = status if isinstance(status, str) and status else "running"
+        review = payload.get("finalReview")
+        if isinstance(review, dict):
+            result = review.get("result")
+            review_status = review.get("status")
+        else:
+            result = None
+            review_status = None
+        self._final_review_status = (
+            review_status if isinstance(review_status, str) and review_status else "pending"
+        )
+        if isinstance(result, str) and result:
+            self._verdict = result
+        elif self._status in _TERMINAL_STATUSES and self._status != "completed":
+            # Engine bailed without a final review — surface the status as the verdict
+            # so the rail badge has something distinct to colour.
+            self._verdict = self._status.upper()
+        else:
+            self._verdict = _DEFAULT_VERDICT
+        self._phase = self._derive_phase()
+
+    def _is_terminal(self) -> bool:
+        # Only consider the plan terminal when the top-level ``status``
+        # field is explicitly terminal. Previously we also checked
+        # ``self._verdict in _TERMINAL_VERDICTS`` here, but that caused
+        # PlanFinished to fire as soon as ``finalReview.result`` was set
+        # — before the engine wrote ``status = "completed"``. The tab
+        # badge would freeze because a later poll (with the real
+        # "completed" status) was suppressed by ``_finished_emitted``.
+        return self._status in _TERMINAL_STATUSES
+
+    def _derive_phase(self) -> str:
+        if self._status == "completed":
+            return _PHASE_DONE
+        if self._status in {"failed", "aborted"}:
+            return _PHASE_FAILED
+        if self._status == "verifying":
+            return _PHASE_VERIFY
+        if self._final_review_status == "running":
+            return _PHASE_REVIEW
+        if any(item.status == "review" for item in self._items):
+            return _PHASE_REVIEW
+        return _PHASE_RUNNING
+
+    def _build_terminal_info(self, payload: dict[str, Any]) -> TerminalInfo:
+        review = payload.get("finalReview") if isinstance(payload, dict) else None
+        review = review if isinstance(review, dict) else {}
+        verification = payload.get("verification") if isinstance(payload, dict) else None
+        verification = verification if isinstance(verification, dict) else {}
+
+        result = review.get("result") if isinstance(review.get("result"), str) else None
+        pr_url = review.get("prUrl") if isinstance(review.get("prUrl"), str) else None
+        pr_number_raw = review.get("prNumber")
+        pr_number = int(pr_number_raw) if isinstance(pr_number_raw, int) else None
+
+        rework_items = review.get("reworkItems")
+        items_reworked = (
+            len(rework_items)
+            if isinstance(rework_items, list)
+            else 0
+        )
+        items_shipped = sum(1 for it in self._items if it.status == "done")
+
+        review_iters_raw = payload.get("reviewIterations")
+        review_iterations = (
+            int(review_iters_raw) if isinstance(review_iters_raw, int) else 0
+        )
+
+        verification_status_raw = verification.get("status")
+        verification_status = (
+            verification_status_raw
+            if isinstance(verification_status_raw, str) and verification_status_raw
+            else None
+        )
+        unchecked = verification.get("unchecked")
+        if isinstance(unchecked, list):
+            verification_unchecked = len(unchecked)
+        elif isinstance(unchecked, int):
+            verification_unchecked = unchecked
+        else:
+            verification_unchecked = 0
+
+        elapsed = self._elapsed_seconds(payload)
+
+        return TerminalInfo(
+            status=self._status,
+            result=result,
+            pr_url=pr_url,
+            pr_number=pr_number,
+            verification_status=verification_status,
+            verification_unchecked=verification_unchecked,
+            items_shipped=items_shipped,
+            items_reworked=items_reworked,
+            items_total=len(self._items),
+            elapsed_seconds=elapsed,
+            review_iterations=review_iterations,
+        )
+
+    @staticmethod
+    def _elapsed_seconds(payload: dict[str, Any]) -> float | None:
+        started = payload.get("startedAt") if isinstance(payload, dict) else None
+        updated = payload.get("updatedAt") if isinstance(payload, dict) else None
+        start_dt = _parse_iso(started)
+        end_dt = _parse_iso(updated)
+        if start_dt is None or end_dt is None:
+            return None
+        return max(0.0, (end_dt - start_dt).total_seconds())
+
+    def _scan_logs(self) -> None:
+        with self._lock:
+            ids = list(self._log_subscribers.keys())
+        for item_id in ids:
+            log_path = self._resolve_log_path(item_id)
+            if log_path is None:
+                continue
+            previous_path = self._log_paths.get(item_id)
+            if previous_path is not None and previous_path != log_path:
+                # Engine started writing a richer file (e.g. worker-<id>.log
+                # superseded a legacy <id>.log); restart from byte 0 so we
+                # don't skip over the prefix of the new file.
+                self._log_positions[item_id] = 0
+            self._log_paths[item_id] = log_path
+            pos = self._log_positions.get(item_id, 0)
+            try:
+                size = log_path.stat().st_size
+            except OSError:
+                continue
+            if size <= pos:
+                continue
+            try:
+                with log_path.open("r", encoding="utf-8") as fh:
+                    fh.seek(pos)
+                    chunk = fh.read()
+                    new_pos = fh.tell()
+            except OSError:
+                continue
+            self._log_positions[item_id] = new_pos
+            if not chunk:
+                continue
+            with self._lock:
+                callbacks = list(self._log_subscribers.get(item_id, ()))
+            for cb in callbacks:
+                cb(chunk)
+
+    def _read_log_snapshot(self, item_id: int) -> str:
+        """Return the full current contents of ``item_id``'s log, or ``""``.
+
+        Used to backfill a freshly attached subscriber so it sees the
+        worker's history. Does **not** advance ``_log_positions`` —
+        existing subscribers continue tailing from wherever they left
+        off, and the next ``poll_now`` only delivers new bytes appended
+        after this snapshot.
+        """
+        log_path = self._resolve_log_path(item_id)
+        if log_path is None:
+            return ""
+        try:
+            return log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _resolve_log_path(self, item_id: int) -> Path | None:
+        """Locate the log file for ``item_id``.
+
+        The orchestrator engine pipes each worker's tmux pane to
+        ``logs/worker-<id>.log`` (and emits a final summary line to the
+        same file on exit). Older runs and tests use the bare
+        ``logs/<id>.log`` form. Prefer the engine's path; fall back to
+        the legacy one so test fixtures and any pre-existing plans keep
+        working.
+        """
+        logs_dir = self._plan_dir / "logs"
+        worker_path = logs_dir / f"worker-{item_id}.log"
+        if worker_path.exists():
+            return worker_path
+        legacy_path = logs_dir / f"{item_id}.log"
+        if legacy_path.exists():
+            return legacy_path
+        return None
+
+    def _read_state(self) -> dict[str, Any] | None:
+        path = self._plan_dir / "state.json"
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _item_from_dict(data: dict[str, Any]) -> DepGraphItem:
+        return DepGraphItem(
+            id=int(data["id"]),
+            description=str(data.get("description", "")),
+            status=str(data.get("status", "queued")),
+            deps=tuple(int(d) for d in data.get("deps", [])),
+        )
+
+
+def _parse_iso(raw: object) -> datetime | None:
+    """Parse an ISO-8601 timestamp (with optional trailing 'Z') to UTC."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    text = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
