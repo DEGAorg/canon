@@ -1,6 +1,6 @@
 [project]
 name = "canon-app"
-version = "0.8.0"
+version = "0.8.1"
 description = "Canon TUI — a unified experience for AI in your terminal."
 readme = "README.md"
 requires-python = ">=3.14"
@@ -61,6 +61,7 @@ build-backend = "hatchling.build"
 packages = ["src/toad"]
 
 [tool.hatch.build.targets.wheel.force-include]
+"cardano/deployments/mainnet.json" = "toad/extensions/dega_panel/cardano_client/deployments/mainnet.json"
 "cardano/client/package.json" = "toad/extensions/dega_panel/cardano_client/package.json"
 "cardano/client/package-lock.json" = "toad/extensions/dega_panel/cardano_client/package-lock.json"
 "cardano/client/tsconfig.json" = "toad/extensions/dega_panel/cardano_client/tsconfig.json"

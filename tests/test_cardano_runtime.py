@@ -128,6 +128,7 @@ async def test_actual_app_mount_automatically_ensures_wallet(isolated, public_pr
 async def test_mounted_chain_selector_preserves_identity_and_funding_without_registry(
     isolated, public_process, monkeypatch,
 ):
+    monkeypatch.setenv("CANON_CARDANO_DEPLOYMENT", str(isolated / "missing.json"))
     app = ChatApp(isolated)
     async with app.run_test(size=(100, 50)) as pilot:
         view = app.query_one(ChatView)
@@ -311,3 +312,33 @@ def test_saved_chain_choice_overrides_legacy_file_but_not_explicit_environment(
     assert default_registry_backend() == "cardano"
     monkeypatch.setenv("DEGA_CHAT_BACKEND", "test")
     assert default_registry_backend() == "test"
+
+
+def test_mainnet_defaults_to_production_manifest_outside_cwd(isolated, monkeypatch):
+    monkeypatch.chdir(isolated)
+    config = cardano_config.load_cardano_config()
+    assert config.deployment.name == "mainnet.json"
+    manifest = json.loads(config.deployment.read_text())
+    assert manifest["network"] == "Mainnet"
+    assert manifest["version"] == 2
+    assert manifest["initialTerms"]["feeAmount"] == "671927000000000"
+
+
+def test_explicit_recording_deployment_is_preserved(isolated, monkeypatch):
+    manifest = isolated / "recording.json"
+    monkeypatch.setenv("CANON_CARDANO_DEPLOYMENT", str(manifest))
+    assert cardano_config.load_cardano_config().deployment == manifest
+
+
+def test_preview_does_not_select_mainnet_manifest(isolated, monkeypatch):
+    monkeypatch.setenv("CANON_CARDANO_NETWORK", "Preview")
+    assert cardano_config.load_cardano_config().deployment == isolated / "cardano/deployment.json"
+
+
+def test_installed_package_prefers_bundled_manifest(isolated, monkeypatch):
+    module = isolated / "site-packages/toad/extensions/dega_panel/cardano_config.py"
+    manifest = module.with_name("cardano_client") / "deployments/mainnet.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}")
+    monkeypatch.setattr(cardano_config, "__file__", str(module))
+    assert cardano_config.default_deployment("Mainnet") == manifest

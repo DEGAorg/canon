@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-08
+
+### Changed
+- Select the confirmed production Cardano registry by default on mainnet and bundle its public manifest.
+- Match the initial Ethereum registration amount: 6,719,270 DEGA for 365 days.
+- Preserve explicitly configured wallets and recording deployments.
+
+
 ## [0.8.0] - 2026-10-08
 
 ### Added

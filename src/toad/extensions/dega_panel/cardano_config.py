@@ -23,6 +23,15 @@ def config_path() -> Path:
     return Path(os.environ.get("CANON_CARDANO_CONFIG", default))
 
 
+def default_deployment(network: str) -> Path:
+    """Locate the production manifest independently of the working directory."""
+    if network == "Preview":
+        return auth_store.CANON_DIR / "cardano/deployment.json"
+    packaged = Path(__file__).with_name("cardano_client") / "deployments/mainnet.json"
+    source = Path(__file__).resolve().parents[4] / "cardano/deployments/mainnet.json"
+    return packaged if packaged.is_file() else source
+
+
 def load_cardano_config() -> CardanoConfig:
     """Read public settings and explicit development overrides without creating a wallet."""
     path = config_path().expanduser()
@@ -37,7 +46,7 @@ def load_cardano_config() -> CardanoConfig:
         wallet = os.environ.get("CANON_CARDANO_WALLET") or raw.get(
             "walletPath", str(base / "wallets" / network.lower()))
         deployment = os.environ.get("CANON_CARDANO_DEPLOYMENT") or raw.get(
-            "deployment", str(base / "deployment.json"))
+            "deployment", str(default_deployment(network)))
         wallet_path, deployment_path = Path(wallet).expanduser(), Path(deployment).expanduser()
         if not wallet_path.is_absolute() or not deployment_path.is_absolute():
             raise ValueError("paths must be absolute")

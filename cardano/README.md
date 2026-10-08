@@ -4,29 +4,35 @@ Canon supports Cardano registration with native DEGA payments and contact discov
 across Cardano and Ethereum. Wallets are generated locally; public Koios endpoints
 provide chain access without a Blockfrost account. Signing secrets stay on your computer.
 
-## Try the mainnet test registry
+## Mainnet registration
 
-This deployment uses real ADA and DEGA. Registration costs **15.1234 DEGA**, plus ADA
-transaction fees and output reserves. The final production price and wallets are not
-configured by this release. No automatic bridge or Ethereum burn is performed.
+The public distribution selects the production mainnet registry by default. Its initial
+registration price is **6,719,270 DEGA**, matching the Ethereum registry at deployment,
+with a **365-day** registration period. ADA transaction fees and output reserves are
+additional. Tokens are sent to the confirmed collector; no automatic bridge or Ethereum
+burn is performed.
 
-From the repository root, install the companion with Node.js 26 or newer available:
+From the repository root, with Node.js 26 or newer available:
 
 ```sh
 uv sync
 uv run python -m toad.cardano_install
-CANON_CARDANO_DEPLOYMENT="$PWD/cardano/deployments/mainnet-mpf-test.json" uv run canon
+uv run canon
 ```
 
-Select Cardano in Chat and use the wallet address displayed in your profile. Fund that
-wallet with ADA and DEGA. Keep a separate ADA-only UTxO available for collateral;
-collateral is normally unspent on a valid transaction. Review the registration price
-in Canon, then submit. Restarting or retrying reconciles the saved transaction.
+Select Cardano in Chat, fund the wallet address displayed in your profile and review the
+current price before registering. Keep a separate ADA-only UTxO available for collateral;
+collateral is normally unspent on a valid transaction. Retrying reconciles the saved
+transaction rather than purchasing another registration.
 
-To test discovery on another computer, use the same public deployment manifest.
-Do not copy wallet secrets. The second computer can resolve registered usernames and
-public chat keys without paying a registration fee. Register there only if you want
-to create another identity. Ethereum and Cardano identities use the same chat transport.
+The production manifest is `deployments/mainnet.json` and is also included in the Python
+package. Explicit `CANON_CARDANO_DEPLOYMENT` or saved deployment settings take precedence;
+remove a demo override or point it at the production manifest to use production. Existing
+wallets and explicit recording configurations are preserved.
+
+A second computer can resolve usernames and public chat keys using the same production
+registry without paying a registration fee or copying wallet secrets. Ethereum and Cardano
+identities share the chat transport. Registration is only needed to create an identity.
 
 ## Registry design
 
@@ -41,19 +47,13 @@ inconsistent provider response fails closed. Large-scale indexing and throughput
 need public-release validation. Simultaneous registrations can conflict on the shared
 root and require a fresh transaction.
 
-Confirmed test deployment:
-
-- Manifest: `deployments/mainnet-mpf-test.json`
-- Policy: `d6db7a1b214dc679812b7cca790c561df94c20964d4bf156cac74195`
-- Bootstrap: `d43964e5a763675382141be65ba3d321ba7319a62278c2a0ba88f11465c03707`
-- Registration period: 365 days
-- Fee destination: the collector encoded in the manifest and validator parameters
-
 The deployable validator is `contracts/validators/registry_mpf.ak`. It always starts
 with an empty uniqueness root. The separate `registry_benchmark` validator permits
-synthetic roots for local measurements and must not be deployed. The older bounded
-registry and `mainnet-demo.json` manifest are retained for existing demo deployments;
-new testing uses the MPF manifest above.
+synthetic roots only for local measurements and must not be deployed. Older demo
+manifests are historical test artifacts and are never selected by the production default.
+
+The production admin key hash and collector address are recorded in `deployments/mainnet.json`.
+The companion verifies the current on-chain terms when quoting registration or renewal.
 
 ## Verification and costs
 
@@ -68,10 +68,22 @@ npm run check
 
 Use Aiken 1.1.24. The tests cover actual Plutus execution, more than eight registrations,
 uniqueness, ownership, payment, renewal, invitations, configuration and pending recovery.
-The user also confirmed registration on the MPF mainnet test deployment.
+The user confirmed registration on a separate MPF mainnet test deployment using the same validator implementation.
 
 See [benchmark instructions](client/benchmark/README.md) and
 [measured results](client/benchmark/mpf-results.json). Those measurements are for the
 benchmark contract and sampled synthetic registry sizes, not a fixed mainnet quote or
 a production audit. ADA reserves, collector-output ADA, network fees and collateral
 are reported separately.
+
+## Production deployment
+
+- Bootstrap transaction: [`02eb4d2748275c06fa6a6d0922bced5a946a30075e8eaabe9239cab15b8922c6`](https://cardanoscan.io/transaction/02eb4d2748275c06fa6a6d0922bced5a946a30075e8eaabe9239cab15b8922c6).
+- Registry policy: `301eb0fc86601695370cee04ee40bc28eaf2819d3bd78d7483759791`.
+- Deployer: `addr1vyvmz3ujjcwvvaxch2036uzsxu67rsh0mecjj6up59a6hxsgn0pay`.
+- Collector: `addr1v872cc5863ku2gh2uwjudq3ca0d0jrgxzxh9yz9q7zdcmcsk0xrkf`.
+- Initial fee: `671927000000000` Cardano DEGA base units (8 decimals).
+
+The amount was read from Ethereum registry
+`0x4c698AC2f25dD82386658080223583e0EEbB523f` at block `26149585`:
+`6719270000000000000000000` DEGA base units (18 decimals), with TTL `31536000` seconds.
