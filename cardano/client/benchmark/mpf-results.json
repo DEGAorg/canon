@@ -1,0 +1,74 @@
+{
+  "scope": "local emulator; synthetic pre-existing roots; not mainnet deployment",
+  "evaluation": "Lucid complete performs local UPLC evaluation; reported budgets are allocated redeemer units",
+  "protocol": {
+    "coinsPerUtxoByte": "4310",
+    "maxTxSize": 16384,
+    "maxTxExMem": "14000000",
+    "maxTxExSteps": "10000000000",
+    "minFeeA": 44,
+    "minFeeB": 155381,
+    "priceMem": 0.0577,
+    "priceStep": 0.0000721,
+    "collateralPercentage": 150
+  },
+  "measuredAt": "2026-10-08T18:46:27.352Z",
+  "results": [
+    {
+      "syntheticExistingRecords": 0,
+      "reservedKeys": 0,
+      "proofBytes": 218,
+      "transactionBytes": 9630,
+      "allocatedCpu": 453092826,
+      "allocatedMemory": 1195636,
+      "networkFeeLovelace": "680934",
+      "recordReserveLovelace": "1749860",
+      "collectorOutputLovelace": "1435230",
+      "rootReserveLovelace": "1297310",
+      "collateralLovelace": "5000000",
+      "fixtureMs": 320
+    },
+    {
+      "syntheticExistingRecords": 100,
+      "reservedKeys": 300,
+      "proofBytes": 913,
+      "transactionBytes": 11022,
+      "allocatedCpu": 571331951,
+      "allocatedMemory": 1599309,
+      "networkFeeLovelace": "773999",
+      "recordReserveLovelace": "1749860",
+      "collectorOutputLovelace": "1435230",
+      "rootReserveLovelace": "1297310",
+      "collateralLovelace": "5000000",
+      "fixtureMs": 360
+    },
+    {
+      "syntheticExistingRecords": 1000,
+      "reservedKeys": 3000,
+      "proofBytes": 1330,
+      "transactionBytes": 11856,
+      "allocatedCpu": 644339108,
+      "allocatedMemory": 1845819,
+      "networkFeeLovelace": "830182",
+      "recordReserveLovelace": "1749860",
+      "collectorOutputLovelace": "1435230",
+      "rootReserveLovelace": "1297310",
+      "collateralLovelace": "5000000",
+      "fixtureMs": 856
+    },
+    {
+      "syntheticExistingRecords": 10000,
+      "reservedKeys": 30000,
+      "proofBytes": 1747,
+      "transactionBytes": 12690,
+      "allocatedCpu": 715026636,
+      "allocatedMemory": 2086903,
+      "networkFeeLovelace": "885885",
+      "recordReserveLovelace": "1749860",
+      "collectorOutputLovelace": "1435230",
+      "rootReserveLovelace": "1297310",
+      "collateralLovelace": "5000000",
+      "fixtureMs": 5494
+    }
+  ]
+}

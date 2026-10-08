@@ -50,3 +50,7 @@ Canon is built on [Toad](https://github.com/batrachian/toad), created by
 with DEGA account integration, strategy workflows, and encrypted chat.
 
 Licensed under [AGPL-3.0](LICENSE).
+
+
+Cardano registration and cross-chain chat discovery are available in 0.8.0.
+See the [Cardano test setup](cardano/README.md) for the opt-in mainnet test deployment.

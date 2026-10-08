@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-08
+
+### Added
+- Cardano chat registration with native DEGA collection, generated local wallets and free public Koios access.
+- Independent registration records with an MPF uniqueness index, owner renewal and invitations.
+- Contact discovery across Ethereum and Cardano, with explicit handling of ambiguous names.
+- Packaged Cardano companion installer and an opt-in mainnet test deployment at 15.1234 DEGA.
+
+### Fixed
+- Registration retries reconcile persisted transactions and recover safely after expiry.
+- Wallet information follows the selected registration chain without duplicate funding fields.
+
+### Release status
+- The included mainnet registry is a user-tested deployment, not the final production registry.
+- Production pricing, deployer and collector configuration remain pending confirmation.
+
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

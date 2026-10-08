@@ -20,7 +20,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from rich.text import Text
 
@@ -29,13 +29,18 @@ from textual.screen import ModalScreen
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual import on
 from textual.events import Resize
-from textual.widgets import Button, Checkbox, Collapsible, Input, Label, ListItem, ListView, Static
+from textual.widgets import Button, Checkbox, Collapsible, Input, Label, ListItem, ListView, Select, Static
 
 from toad.extensions.dega_panel.registration import Registration, RenewalQuote
+from toad.extensions.dega_panel.cardano_runtime import CardanoWallet, ensure_cardano_wallet
+from toad.extensions.dega_panel.cardano_config import (
+    load_cardano_config, save_registration_backend,
+)
 from toad.extensions.dega_panel.chat_contact import (
     add_my_node,
     contacts,
     remember_contact,
+    remember_binding,
     set_active_node,
 )
 from toad.extensions.dega_panel.chat_identity import (
@@ -61,19 +66,34 @@ from toad.extensions.dega_panel.registry_client import (
     display_name,
 )
 
+from toad.extensions.dega_panel.registry_discovery import (
+    ContactBinding, DiscoveryResult, discover_contacts,
+)
+
 from toad.extensions.dega_panel.rooms.protocol import PREFIX, RoomError
 from toad.extensions.dega_panel.rooms.service import RoomService
 from toad.extensions.dega_panel.rooms.view import RoomsView
 
 
+if TYPE_CHECKING:
+    from toad.app import ToadApp
+
+
 def default_registry_backend() -> str:
     """The panel's chat backend.
 
-    Order of precedence: ~/.canon/dega-chat.env, then process env, then
-    ``chain``. This keeps the app plug-and-play for users while still letting
+    Order of precedence: process environment, saved registration-chain choice,
+    legacy ~/.canon/dega-chat.env, then ``chain``. This keeps the app plug-and-play for users while still letting
     internal test harnesses override the backend when needed.
     """
-    return os.environ.get("DEGA_CHAT_BACKEND") or _read_chat_env_key("DEGA_CHAT_BACKEND") or "chain"
+    configured = os.environ.get("DEGA_CHAT_BACKEND")
+    if configured:
+        return configured
+    try:
+        selected = load_cardano_config().registration_backend
+    except RegistryError:
+        selected = None
+    return selected or _read_chat_env_key("DEGA_CHAT_BACKEND") or "chain"
 
 
 def default_offline() -> bool:
@@ -81,7 +101,7 @@ def default_offline() -> bool:
 
     Internal test harnesses may force a non-chain backend.
     """
-    return default_registry_backend() != "chain"
+    return default_registry_backend() not in ("chain", "cardano")
 
 
 class RenewRegistration(ModalScreen[bool]):
@@ -136,6 +156,47 @@ class RenewRegistration(ModalScreen[bool]):
         self.dismiss(event.button.id == "confirm-renew")
 
 
+class ChooseContact(ModalScreen[ContactBinding | None]):
+    """Require an explicit binding choice when discovery is ambiguous or incomplete."""
+
+    DEFAULT_CSS = """
+    ChooseContact { align: center middle; }
+    ChooseContact > Vertical {
+        width: 70; max-width: 95%; height: auto; padding: 1 2;
+        background: $surface; border: round $primary;
+    }
+    ChooseContact Static { height: auto; }
+    ChooseContact Button { width: 100%; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, result: DiscoveryResult) -> None:
+        super().__init__()
+        self.result = result
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static("Choose a registered contact", markup=False)
+            for failure in self.result.failures:
+                yield Static(f"Incomplete search: {failure}", markup=False)
+            for index, binding in enumerate(self.result.matches):
+                yield Button(f"{display_name(binding.username)} · {binding.badge}",
+                             id=f"binding-{index}")
+                yield Static(f"Registry: {binding.registry}", markup=False)
+            yield Button("Cancel", id="cancel-contact-choice")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button_id = event.button.id or ""
+        if button_id.startswith("binding-"):
+            self.dismiss(self.result.matches[int(button_id.removeprefix("binding-"))])
+        else:
+            self.dismiss(None)
+
+
 class ChatView(Vertical):
     """Profile + multi-node + contacts + E2E conversation (fee-gated)."""
 
@@ -157,6 +218,7 @@ class ChatView(Vertical):
     ChatView #side Collapsible { height: auto; }
     ChatView #registration-status { height: auto; padding: 0 1; }
     ChatView #side #profile { height: auto; padding: 0 1; }
+    ChatView #registration-chain { height: 3; }
     ChatView #side #my-nodes-list { height: auto; max-height: 40%; background: transparent; }
     ChatView.compact #chat-wrap { layout: vertical; }
     ChatView.compact #side {
@@ -251,6 +313,11 @@ class ChatView(Vertical):
         self._offline = offline
         if registry_backend is None:
             registry_backend = default_registry_backend() if not offline else "test"
+        self._registry_generation = 0
+        self._switching_registry = False
+        self._registry_backend = registry_backend
+        self._cardano_wallet: CardanoWallet | None = None
+        self._cardano_wallet_error: str | None = None
         self._registry_error: str | None = None
         self._registry: RegistryClient | None = None
         try:
@@ -362,16 +429,19 @@ class ChatView(Vertical):
     async def ensure_chat_ready(self) -> None:
         """Load on-chain identity only when the chat tab is actually opened."""
         await self.query_one(RoomsView).activate()
-        if self._chat_ready:
+        if self._chat_ready or self._switching_registry:
             return
         async with self._resume_lock:
+            generation = self._registry_generation
+            registry = self._registry
             try:
                 await self._restore_direct_history()
             except (OSError, sqlite3.Error):
                 logging.getLogger(__name__).exception("chat_history_restore_failed")
                 self.notify("Could not open saved history. Check local storage.", severity="error")
                 return
-            if self._chat_ready:
+            if (self._chat_ready or generation != self._registry_generation
+                    or registry is not self._registry or self._switching_registry):
                 return
             self._resume_started = True
             try:
@@ -379,18 +449,112 @@ class ChatView(Vertical):
                 # Hide the open-node form while we resolve the on-chain user.
                 await self.rebuild()
                 # Load display terms and authoritative registration separately.
-                if self._registry is not None and not self._offline:
+                if registry is not None and not self._offline:
                     try:
-                        self._snapshot_cache = await asyncio.to_thread(self._registry.state_snapshot)
+                        snapshot = await asyncio.to_thread(registry.state_snapshot)
+                        if generation != self._registry_generation or registry is not self._registry:
+                            return
+                        self._snapshot_cache = snapshot
                     except Exception as exc:
                         logging.getLogger(__name__).warning("chat snapshot unavailable: %s", exc)
+                if generation != self._registry_generation or registry is not self._registry:
+                    return
                 await self._resume_node()
+                if generation != self._registry_generation or registry is not self._registry:
+                    return
                 self._chat_ready = True
                 if not self._registration_error:
                     self._set_open_node_status("")
             finally:
                 self._resume_started = False
                 await self.rebuild()
+
+    def set_cardano_wallet(self, wallet: CardanoWallet | None, error: str | None) -> None:
+        """Accept only the public startup result; registration setup stays independent."""
+        self._cardano_wallet, self._cardano_wallet_error = wallet, error
+        if not self.is_mounted:
+            return
+        self._render_cardano_setup_retry()
+        self.run_worker(self._render_profile(), name="cardano-wallet-profile",
+                        group="cardano-wallet-profile", exclusive=True)
+
+    def _render_cardano_setup_retry(self) -> None:
+        selected = not self._offline and self._registry_backend == "cardano"
+        retry = self.query_one("#retry-cardano-wallet", Button)
+        retry.display = selected and bool(self._cardano_wallet_error or self._registry_error)
+
+    @on(Button.Pressed, "#retry-cardano-wallet")
+    def retry_cardano_wallet(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.run_worker(self._retry_cardano_setup(), name="cardano-wallet",
+                        group="cardano-wallet", exclusive=True)
+
+    async def _retry_cardano_setup(self) -> None:
+        await self._ensure_cardano_wallet()
+        if self._cardano_wallet is not None and self._registry_backend == "cardano":
+            await self._select_registration_chain("cardano")
+
+    async def _ensure_cardano_wallet(self) -> None:
+        try:
+            wallet = await asyncio.to_thread(ensure_cardano_wallet)
+            self.set_cardano_wallet(wallet, None)
+            app = cast("ToadApp", self.app)
+            app.cardano_wallet = wallet
+            app.cardano_wallet_error = None
+        except (RegistryError, OSError) as exc:
+            self.set_cardano_wallet(None, str(exc))
+
+    @on(Select.Changed, "#registration-chain")
+    def registration_chain_changed(self, event: Select.Changed) -> None:
+        event.stop()
+        backend = event.value
+        if self._offline:
+            return
+        if backend not in ("chain", "cardano") or backend == self._registry_backend:
+            return
+        self.run_worker(self._select_registration_chain(str(backend)),
+                        name="registration-chain", group="registration-chain", exclusive=True)
+
+    async def _select_registration_chain(self, backend: str) -> None:
+        selector = self.query_one("#registration-chain", Select)
+        if self._opening_node or self._renewing:
+            selector.value = self._registry_backend
+            return
+        selector.disabled = True
+        if self._selected_contact:
+            self._drafts[self._selected_contact.get("pubkey", "")] = self.query_one(
+                "#composer", Input).value
+        try:
+            self._switching_registry = True
+            self._registry_generation += 1
+            self._registry_backend = backend
+            self._registry = None
+            self._registry_error = None
+            self._registration = None
+            self._registration_error = None
+            self._snapshot_cache = {}
+            self._my_username = None
+            self._my_nodes = []
+            self._chat_ready = False
+            self._render_cardano_setup_retry()
+            try:
+                await asyncio.to_thread(save_registration_backend, backend)
+            except (RegistryError, OSError) as exc:
+                self.notify(str(exc), severity="warning")
+            if backend == "cardano" and self._cardano_wallet is None:
+                await self._ensure_cardano_wallet()
+            try:
+                self._registry = await asyncio.to_thread(RegistryClient, backend=backend)
+            except (RegistryError, ValueError, TypeError) as exc:
+                self._registry_error = str(exc)
+            self._switching_registry = False
+            await self.ensure_chat_ready()
+            if self._my_username and self._selected_contact:
+                self.query_one("#composer", Input).value = self._drafts.get(
+                    self._selected_contact.get("pubkey", ""), "")
+        finally:
+            self._switching_registry = False
+            selector.disabled = False
 
     # --- helpers -----------------------------------------------------------
     def _inbox_store(self):
@@ -401,6 +565,10 @@ class ChatView(Vertical):
     def _wallet(self) -> str:
         if self._offline:
             return "Test mode"
+        if self._registry_backend == "cardano":
+            if self._cardano_wallet is not None:
+                return self._cardano_wallet.address
+            return (self._snapshot_cache or {}).get("funding_address") or "Not configured"
         try:
             return configured_wallet_address() or "Not configured"
         except ValueError:
@@ -423,7 +591,12 @@ class ChatView(Vertical):
         with Horizontal(id="chat-wrap"):
             with VerticalScroll(id="side"):
                 with Collapsible(title="Profile", id="account-details", collapsed=True):
+                    yield Label("Registration chain")
+                    yield Select([("Ethereum", "chain"), ("Cardano", "cardano")],
+                                 value=self._registry_backend if not self._offline else "chain",
+                                 allow_blank=False, id="registration-chain", disabled=self._offline)
                     yield Static(id="profile")
+                    yield Button("Retry Cardano setup", id="retry-cardano-wallet", compact=True)
                     with Vertical(id="presence-controls"):
                         yield Checkbox(
                             "Share presence", value=self._sharing, id="presence-sharing",
@@ -475,6 +648,8 @@ class ChatView(Vertical):
             yield RoomsView(self)
 
     async def on_mount(self) -> None:
+        self.set_cardano_wallet(getattr(self.app, "cardano_wallet", None),
+                                getattr(self.app, "cardano_wallet_error", None))
         self.query_one(RoomsView).display = False
         await self._render_actions()
         self.set_interval(1, self._update_presence_labels)
@@ -491,9 +666,16 @@ class ChatView(Vertical):
         """Refresh chain state without blocking typing or hiding RPC failures."""
         if not self._chat_ready or self._registry is None:
             return
+        generation = self._registry_generation
+        registry = self._registry
         try:
-            self._snapshot_cache = await asyncio.to_thread(self._registry.state_snapshot)
+            snapshot = await asyncio.to_thread(registry.state_snapshot)
+            if generation != self._registry_generation or registry is not self._registry:
+                return
+            self._snapshot_cache = snapshot
         except Exception as exc:
+            if generation != self._registry_generation or registry is not self._registry:
+                return
             logging.getLogger(__name__).warning("chat snapshot unavailable: %s", exc)
         await self._resume_node()
         await self.rebuild()
@@ -506,9 +688,17 @@ class ChatView(Vertical):
         if self._registry is None:
             return
         async with self._registration_lock:
+            registry = self._registry
+            generation = self._registry_generation
+            if registry is None:
+                return
             try:
-                registration = await asyncio.to_thread(self._registry.registration_status)
+                registration = await asyncio.to_thread(registry.registration_status)
+                if generation != self._registry_generation or registry is not self._registry:
+                    return
             except Exception as exc:
+                if generation != self._registry_generation or registry is not self._registry:
+                    return
                 self._registration_error = str(exc)
                 return
             self._registration = registration
@@ -528,6 +718,9 @@ class ChatView(Vertical):
         if registration is None or self._registration_error:
             return False
         elapsed = max(0, time.monotonic() - self._registration_read_at)
+        if registration.expires_at_ms is not None and registration.checked_at_ms is not None:
+            return (registration.active
+                    and registration.checked_at_ms + elapsed * 1000 < registration.expires_at_ms)
         return registration.active and registration.checked_at + elapsed < registration.expires_at
 
     def _render_registration(self) -> None:
@@ -566,7 +759,10 @@ class ChatView(Vertical):
             if not await self.app.push_screen_wait(RenewRegistration(quote)):
                 return
             self._render_registration()
-            await asyncio.to_thread(self._registry.renew_node, quote)
+            result = await asyncio.to_thread(self._registry.renew_node, quote)
+            if result.get("status") == "pending":
+                self.notify("Renewal submitted; awaiting confirmation", severity="information")
+                return
             await self._resume_node()
             if self._registration_error:
                 self.notify("Transaction confirmed; retry to refresh registration",
@@ -759,13 +955,13 @@ class ChatView(Vertical):
             fee = await asyncio.to_thread(registry.fee_weega)
             decimals = await asyncio.to_thread(registry.fee_decimals)
             fee_label = fee_display(fee, decimals)
-            self._set_open_node_status(f"Registering… paying {fee_label}")
+            self._set_open_node_status(f"Registering for {fee_label}… waiting for confirmation")
             result = await asyncio.to_thread(
                 registry.open_node, canon, nostr_pubkey=self._me.pubkey,
                 nostr_secret=self._me._keys.secret_key().to_hex(),
             )
             if result.get("status") == "pending":
-                self._set_open_node_status("Registration pending; check transaction confirmation")
+                self._set_open_node_status("Registration submitted; awaiting confirmation. Check again shortly.")
                 return
             save_username(canon, path=self._identity_path)
             self._my_nodes = add_my_node(canon, path=self._contacts_path)
@@ -798,6 +994,29 @@ class ChatView(Vertical):
         self.query_one("#composer", Input).value = ""
         self.notify("Conversation cleared for this session")
 
+    async def _discover_and_save_contact(self, target: str, contact_input: Input) -> None:
+        try:
+            result = await asyncio.to_thread(discover_contacts, target)
+            if not result.matches:
+                message = ("; ".join(result.failures) if result.failures
+                           else f"{target}: registration missing or expired")
+                self.notify(message, severity="error")
+                return
+            if len(result.matches) > 1 or result.failures:
+                binding = await self.app.push_screen_wait(ChooseContact(result))
+            else:
+                binding = result.matches[0]
+            if binding is None:
+                return
+            remember_binding(binding, path=self._contacts_path)
+        except (RegistryError, OSError) as exc:
+            self.notify(f"Could not save contact: {exc}", severity="error")
+            return
+        self.notify(f"Added {display_name(binding.username)} · {binding.badge}")
+        contact_input.value = ""
+        self.show_room(self._contact_return_to_room)
+        self.query_one("#contact-new", Button).focus()
+
     async def _add_contact(self) -> None:
         if self._registry is None or self._registry_error:
             self.notify(self._registry_error or "backend unavailable", severity="error")
@@ -809,6 +1028,9 @@ class ChatView(Vertical):
         target = contact_input.value.strip()
         if not target:
             self.notify("Enter the person's registered username", severity="warning")
+            return
+        if not self._offline:
+            await self._discover_and_save_contact(target, contact_input)
             return
         try:
             member = await asyncio.wait_for(
@@ -1029,13 +1251,6 @@ class ChatView(Vertical):
         if any(contact["pubkey"] == sender for contact in known):
             return
         username = ""
-        if not self._offline and self._registry is not None:
-            try:
-                username = await asyncio.to_thread(self._registry.username_for_pubkey, sender)
-            except Exception:
-                logging.getLogger(__name__).warning(
-                    "chat_sender_lookup_failed", extra={"sender_pubkey": sender}, exc_info=True,
-                )
         remember_contact(
             sender, username=username, pubkey=bytes.fromhex(sender), path=self._contacts_path,
         )
@@ -1088,15 +1303,17 @@ class ChatView(Vertical):
         return f"[b]Chat[/]{fee}  {self._status()}"
 
     async def _render_profile(self) -> None:
+        self._render_cardano_setup_retry()
         prof = self.query_one("#profile", Static)
         wallet = self._wallet()
-        wallet_state = "Configured" if wallet.startswith("0x") else wallet
-        wallet_line = f"\n{wallet}" if wallet.startswith("0x") else ""
+        wallet_configured = wallet.startswith("0x") or self._registry_backend == "cardano"
+        wallet_state = "Configured" if wallet_configured and wallet != "Not configured" else wallet
+        wallet_line = f"\n{wallet}" if wallet_configured and wallet != "Not configured" else ""
         registration = "Not registered"
         if self._my_username:
             registration = display_name(self._my_username)
         elif self._registry_error:
-            registration = "Unable to check registry"
+            registration = f"Unable to check registry\n{self._registry_error}"
         elif not self._chat_ready:
             registration = "Checking registry…"
         prof.update(
@@ -1125,13 +1342,17 @@ class ChatView(Vertical):
             section.title = "Contacts · 0"
             if not self._my_username:
                 return
-            known = {c["wallet"].lower(): c for c in contacts(path=self._contacts_path)}
+            known = {c["id"]: c for c in contacts(path=self._contacts_path)}
             section.title = f"Contacts · {len(known)}"
             if not known:
                 await lst.append(ListItem(Static("[dim](no contacts yet)[/]")))
                 return
             for w, c in known.items():
                 label = c.get("username") or c.get("wallet", w)[:14]
+                if c.get("chain"):
+                    label += f" · {c['chain'].capitalize()} · {c['network']}"
+                elif not c.get("verified"):
+                    label += " · Unverified"
                 row = ListItem(
                     Static(" ", classes="contact-presence"),
                     Static(label, classes="contact-name"),
@@ -1139,7 +1360,7 @@ class ChatView(Vertical):
                 )
                 row.set_class(
                     bool(not self.query_one(RoomsView).display and self._selected_contact and
-                         c["wallet"] == self._selected_contact.get("wallet")),
+                         c["id"] == self._selected_contact.get("id")),
                     "selected-contact",
                 )
                 await lst.append(row)
@@ -1206,7 +1427,8 @@ class ChatView(Vertical):
             uname.disabled = False
             contact_input.classes = "hidden"
             open_btn.display = True
-            open_btn.disabled = self._opening_node or bool(self._registration_error)
+            open_btn.disabled = (self._opening_node or bool(self._registration_error)
+                                 or bool(self._registry_error) or self._registry is None)
             add_contact_btn.display = False
             send_btn.display = False
             swap_btn.display = False

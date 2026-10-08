@@ -15,6 +15,8 @@ import os
 from pathlib import Path
 
 from toad.extensions.dega_panel.auth_store import CANON_DIR, _ensure_dir
+from toad.extensions.dega_panel.registry_client import canonical_username
+from toad.extensions.dega_panel.registry_discovery import ContactBinding
 
 CONTACTS_FILE = CANON_DIR / "chat-contacts.json"
 
@@ -56,7 +58,7 @@ def remember_contact(wallet: str, *, username: str = "", pubkey: bytes = b"",
     """Learn a contact from a resolved/invited member."""
     data = _load(_path(path))
     key = wallet.lower()
-    existing = data["contacts"].get(key, {})
+    existing = data["contacts"].get(key, {"verified": False})
     if username:
         existing["username"] = username
     if pubkey:
@@ -71,8 +73,8 @@ def contacts(path: str | Path | None = None) -> list[dict]:
     data = _load(_path(path))
     out = []
     for wallet, meta in data["contacts"].items():
-        out.append({"wallet": wallet, "username": meta.get("username", ""),
-                    "pubkey": meta.get("pubkey", "")})
+        out.append({**meta, "id": wallet, "wallet": meta.get("wallet", wallet),
+                    "username": meta.get("username", ""), "pubkey": meta.get("pubkey", "")})
     return out
 
 
@@ -80,7 +82,7 @@ def add_my_node(username: str, *, path: str | Path | None = None) -> list[str]:
     """Register the single node alias this user has opened."""
     p = _path(path)
     data = _load(p)
-    canon = username.split(".")[0]
+    canon = canonical_username(username)
     data["my_nodes"] = [canon]
     data["active_node"] = canon
     _write(p, data)
@@ -96,7 +98,7 @@ def set_active_node(username: str, *, path: str | Path | None = None) -> None:
     """Remember the currently active node alias (idempotent)."""
     p = _path(path)
     data = _load(p)
-    data["active_node"] = username.split(".")[0]
+    data["active_node"] = canonical_username(username)
     _write(p, data)
 
 
@@ -110,3 +112,15 @@ def clear_contacts(*, path: str | Path | None = None) -> None:
     data = _load(p)
     data["contacts"] = {}
     _write(p, data)
+
+
+def remember_binding(binding: ContactBinding, *, path: str | Path | None = None) -> None:
+    """Persist the selected registry provenance and its exact Nostr key."""
+    target = _path(path)
+    data = _load(target)
+    data["contacts"][binding.contact_id] = {
+        "chain": binding.chain, "network": binding.network, "registry": binding.registry,
+        "username": binding.username, "wallet": binding.owner,
+        "pubkey": binding.nostr_pubkey.hex(), "verified": True,
+    }
+    _write(target, data)

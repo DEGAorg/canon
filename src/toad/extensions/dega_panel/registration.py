@@ -13,6 +13,8 @@ class Registration:
     member_count: int
     active: bool
     checked_at: int
+    expires_at_ms: int | None = None
+    checked_at_ms: int | None = None
 
     @property
     def expiry_label(self) -> str:

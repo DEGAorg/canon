@@ -34,6 +34,7 @@ from toad import atomic
 from toad.session_tracker import SessionTracker, SessionDetails
 
 if TYPE_CHECKING:
+    from toad.extensions.dega_panel.cardano_runtime import CardanoWallet
     from toad.screens.main import MainScreen
     from toad.screens.settings import SettingsScreen
     from toad.screens.store import StoreScreen
@@ -175,6 +176,9 @@ def get_sessions_screen() -> SessionsScreen:
 class ToadApp(App, inherit_bindings=False):
     """The top level Canon TUI app."""
 
+    cardano_wallet: "CardanoWallet | None" = None
+    cardano_wallet_error: str | None = None
+
     CSS_PATH = "toad.tcss"
     SCREENS = {
         "settings": get_settings_screen,
@@ -203,7 +207,7 @@ class ToadApp(App, inherit_bindings=False):
     ]
     ALLOW_IN_MAXIMIZED_VIEW = ""
 
-    _settings = var(dict)
+    _settings: var[dict[str, Any]] = var(dict)
     column: reactive[bool] = reactive(False)
     column_width: reactive[int] = reactive(100)
     scrollbar: reactive[str] = reactive("normal")
@@ -213,7 +217,7 @@ class ToadApp(App, inherit_bindings=False):
     terminal_title_icon: var[str] = var("🎛️")
     terminal_title_flash = var(0)
     terminal_title_blink = var(False)
-    project_dir = var(Path)
+    project_dir: var[Path] = var(Path)
     show_sessions = var(False, toggle_class="-show-sessions-bar")
 
     HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (100, "-wide")]
@@ -233,7 +237,7 @@ class ToadApp(App, inherit_bindings=False):
             project_dir: Project directory.
             mode: Initial mode.
         """
-        self.settings_changed_signal: Signal[tuple[int, object]] = Signal(
+        self.settings_changed_signal: Signal[tuple[str, object]] = Signal(
             self, "settings_changed"
         )
         self.agent_data = agent_data
@@ -321,14 +325,14 @@ class ToadApp(App, inherit_bindings=False):
         """
         if self._supports_pyperclip is None:
             try:
-                import pyperclip
+                import pyperclip  # type: ignore[import-untyped]  # Optional library has no bundled stubs.
             except ImportError:
                 self._supports_pyperclip = False
             else:
                 self._supports_pyperclip = True
 
         if self._supports_pyperclip:
-            import pyperclip
+            import pyperclip  # type: ignore[import-untyped]  # Optional library has no bundled stubs.
 
             try:
                 pyperclip.copy(text)
@@ -479,7 +483,7 @@ class ToadApp(App, inherit_bindings=False):
         ):
             return
 
-        from notifypy import Notify
+        from notifypy import Notify  # type: ignore[import-untyped]  # Optional notification library.
 
         notification = Notify()
         notification.message = message
@@ -606,6 +610,7 @@ class ToadApp(App, inherit_bindings=False):
         return session_details
 
     async def on_mount(self) -> None:
+        self.initialize_cardano_wallet()
         self.capture_event("canon-run")
         self.anon_id  # Created on frst reference
         if mode := self._initial_mode:
@@ -621,6 +626,31 @@ class ToadApp(App, inherit_bindings=False):
         from toad.socket_controller import start_socket_server
 
         self._socket_server = await start_socket_server(self)
+
+    @work(thread=True, exit_on_error=False)
+    def initialize_cardano_wallet(self) -> None:
+        """Ensure the persistent Cardano wallet without delaying startup or contacting a chain."""
+        from toad.extensions.dega_panel.cardano_runtime import ensure_cardano_wallet
+        from toad.extensions.dega_panel.registry_client import RegistryError
+
+        try:
+            wallet, error = ensure_cardano_wallet(), None
+        except (RegistryError, OSError) as exc:
+            wallet, error = None, str(exc)
+        self.call_from_thread(self._cardano_wallet_ready, wallet, error)
+
+    def _cardano_wallet_ready(
+        self, wallet: "CardanoWallet | None", error: str | None,
+    ) -> None:
+        from toad.extensions.dega_panel.chat import ChatView
+
+        self.cardano_wallet = wallet
+        self.cardano_wallet_error = error
+        for screen in self.screen_stack:
+            for view in screen.query(ChatView):
+                view.set_cardano_wallet(wallet, error)
+        if error:
+            self.notify(error, title="Cardano wallet", severity="warning", timeout=12)
 
     async def on_unmount(self) -> None:
         if hasattr(self, "_socket_server") and self._socket_server:

@@ -104,6 +104,8 @@ async def test_ui_expired_recovery_cancel_then_renew(wallet_dir, memory):
         status = view.query_one("#registration-status", Static)
         assert "Expired" in str(status.render())
         assert view.query_one("#btn-renew-registration", Button).display
+        await pilot.click("#registration-section CollapsibleTitle")
+        await pilot.pause()
         await pilot.click("#btn-renew-registration")
         await pilot.pause()
         assert isinstance(app.screen, RenewRegistration)

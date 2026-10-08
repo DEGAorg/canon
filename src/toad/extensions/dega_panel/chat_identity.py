@@ -61,14 +61,24 @@ def resolve_identity_secret_key(
 
     Precedence:
     1. explicit signer_key argument
-    2. ~/.canon/dega-chat.env (DEGA_CHAT_PK) — same file/precedence the registry uses
-    3. DEGA_CHAT_PK process env
-    4. ~/.canon/wallet.env WALLET_PRIVATE_KEY
-    5. persisted ~/.canon/chat-identity.json secret_key_nsec
+    2. explicit DEGA_CHAT_IDENTITY_FILE (isolated profile)
+    3. ~/.canon/dega-chat.env (DEGA_CHAT_PK) — same file/precedence the registry uses
+    4. DEGA_CHAT_PK process env
+    5. ~/.canon/wallet.env WALLET_PRIVATE_KEY
+    6. persisted ~/.canon/chat-identity.json secret_key_nsec
     """
     p = _identity_path(path)
     if signer_key:
         return signer_key
+    if path is None and os.environ.get("DEGA_CHAT_IDENTITY_FILE"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            secret = data["secret_key_nsec"]
+            if not isinstance(secret, str) or not secret:
+                raise ValueError("missing profile key")
+            return secret
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError("Cannot read the selected chat identity file") from exc
     # The registry reads DEGA_CHAT_PK from ~/.canon/dega-chat.env first; the chat
     # identity must resolve the SAME key or the wallet <-> pubkey binding breaks.
     file_key = _read_chat_env_key("DEGA_CHAT_PK")
@@ -120,13 +130,15 @@ def load_or_create_identity(
 
         keys = NostrKeys
     p = _identity_path(path)
-    sk = resolve_identity_secret_key(path=p, signer_key=signer_key)
+    sk = resolve_identity_secret_key(path=path, signer_key=signer_key)
     if sk:
         sk = sk[2:] if sk.startswith("0x") else sk
         try:
             return keys.parse(sk), False  # type: ignore[return-value]
-        except Exception:  # noqa: BLE001 - bad key -> fall through to persisted
-            pass
+        except Exception as exc:  # noqa: BLE001 - SDK may raise untyped errors.
+            if path is None and os.environ.get("DEGA_CHAT_IDENTITY_FILE"):
+                raise ValueError("Selected chat identity contains an invalid key") from exc
+
     # 2) Reuse a persisted identity if present.
     data = _load(p)
     cached = data.get("secret_key_nsec")
