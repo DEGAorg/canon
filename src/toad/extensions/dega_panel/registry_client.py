@@ -28,12 +28,17 @@ from collections.abc import Callable
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from web3.types import Nonce, TxParams
+from typing import TYPE_CHECKING, Literal
+
+from web3.types import Nonce, TxParams, Wei
 
 from toad.extensions.dega_panel.auth_store import CANON_DIR
 from toad.extensions.dega_panel.chat_protocol import DEGA_DECIMALS, format_dega_amount
 from toad.extensions.dega_panel.registration import Registration, RenewalQuote
 from toad.extensions.dega_panel.gating import chat_fee_weega, max_users_per_node
+
+if TYPE_CHECKING:
+    from toad.extensions.dega_panel.cardano_registry import CardanoRegistry
 
 _DEGA_CHAT_ENV = CANON_DIR / "dega-chat.env"
 
@@ -555,7 +560,7 @@ class ChainRegistry:
             TxParams({"from": self._sender, "nonce": self._next_nonce(), "gas": 100_000,
                       **self._transaction_fees()})
         )
-        submit_approval(self, tx)
+        submit_approval(self, dict(tx))
         if int(token.functions.allowance(self._sender, self._registry).call()) < fee:
             raise RegistryError(
                 "Approval resolved without sufficient allowance. Retry approval before registering; "
@@ -574,12 +579,12 @@ class ChainRegistry:
         )
         return self._send(tx, {"action": "invite", "username": display_name(canon), "member": member})
 
-    def _transaction_fees(self) -> dict[str, int]:
+    def _transaction_fees(self) -> TxParams:
         """Give EIP-1559 transactions a positive tip and base-fee headroom."""
         block = self._w3.eth.get_block("latest")
         priority = max(int(self._w3.eth.max_priority_fee), 1_000_000_000)
-        return {"maxPriorityFeePerGas": priority,
-                "maxFeePerGas": 2 * int(block["baseFeePerGas"]) + priority}
+        return {"maxPriorityFeePerGas": Wei(priority),
+                "maxFeePerGas": Wei(2 * int(block["baseFeePerGas"]) + priority)}
 
     def _next_nonce(self) -> Nonce:
         return self._w3.eth.get_transaction_count(self._sender, "pending")
@@ -624,7 +629,7 @@ class ChainRegistry:
             pass
 
     def _revert_reason(self, tx: TxParams, block_number: int | None) -> str | None:
-        block: str | int
+        block: Literal["latest"] | int
         if block_number is None:
             block = "latest"
         else:
@@ -713,15 +718,22 @@ class RegistryClient:
     Backends:
     - ``test`` (default): in-memory TestRegistry — offline, testable.
     - ``chain``: real on-chain via ChainRegistry (web3 → Ethereum mainnet by default).
+    - ``cardano``: configured Cardano registry through the TypeScript companion.
     - ``canon-cli``: reserved (DEGA Core signing); currently returns 'pending'.
     """
 
     def __init__(self, *, backend: str = "test", **kw) -> None:
-        if backend not in ("test", "chain", "canon-cli"):
+        if backend not in ("test", "chain", "cardano", "canon-cli"):
             raise RegistryError(f"unknown backend: {backend!r}")
         self._backend = backend
         self._sim = TestRegistry(**kw) if backend == "test" else None
-        self._chain = ChainRegistry(**kw) if backend == "chain" else None
+        self._chain: ChainRegistry | CardanoRegistry | None = (
+            ChainRegistry(**kw) if backend == "chain" else None
+        )
+        if backend == "cardano":
+            from toad.extensions.dega_panel.cardano_registry import CardanoRegistry
+
+            self._chain = CardanoRegistry(**kw)
 
     def fee_weega(self) -> int:
         if self._chain:
@@ -842,7 +854,7 @@ class RegistryClient:
     def resolve_member(self, username: str) -> dict:
         """Resolve ``name``/``name.dega`` to {username, pubkey, wallet} if registered."""
         if self._chain:
-            return self._chain.resolve_member(username)
+            return dict(self._chain.resolve_member(username) or {})
         if self._sim:
             node = self._sim._nodes.get(canonical_username(username))
             if not node or not self._sim.is_active(username):
@@ -868,6 +880,10 @@ class RegistryClient:
 
     def registration_status(self) -> Registration:
         """Return the signing wallet's registration, including expired nodes."""
+        from toad.extensions.dega_panel.cardano_registry import CardanoRegistry
+
+        if isinstance(self._chain, CardanoRegistry):
+            return self._chain.registration_status()
         owner = self._sender_address()
         if self._chain:
             return self._chain.registration_of_owner(owner)
@@ -893,6 +909,10 @@ class RegistryClient:
 
     def state_snapshot(self) -> dict:
         """For the UI header: fee, cap, and the node I own (if any)."""
+        from toad.extensions.dega_panel.cardano_registry import CardanoRegistry
+
+        if isinstance(self._chain, CardanoRegistry):
+            return self._chain.state_snapshot()
         if self._chain:
             sender = self._chain._sender
             owned = self._chain.username_of_owner(sender)

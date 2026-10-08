@@ -71,3 +71,39 @@ def test_dega_chat_env_key_keeps_leading_zeros(tmp_path, monkeypatch) -> None:
     canon_dir = _isolate(monkeypatch, tmp_path, chat_env_key="0" + "b" * 63)
     monkeypatch.delenv("DEGA_CHAT_PK", raising=False)
     assert resolve_identity_secret_key(path=canon_dir / "chat-identity.json") == "0" + "b" * 63
+
+
+def test_explicit_profile_overrides_existing_wallet_keys(tmp_path, monkeypatch):
+    from nostr_sdk import Keys
+
+    canon_dir = _isolate(monkeypatch, tmp_path, chat_env_key="11" * 32)
+    (canon_dir / "wallet.env").write_text("WALLET_PRIVATE_KEY=" + "22" * 32)
+    fresh = Keys.generate()
+    profile = tmp_path / "demo.json"
+    profile.write_text(json.dumps({"secret_key_nsec": fresh.secret_key().to_bech32()}))
+    monkeypatch.setenv("DEGA_CHAT_IDENTITY_FILE", str(profile))
+    loaded, created = chat_identity.load_or_create_identity()
+    assert loaded.public_key().to_hex() == fresh.public_key().to_hex()
+    assert not created
+
+
+def test_missing_selected_profile_never_falls_back(tmp_path, monkeypatch):
+    import pytest
+
+    _isolate(monkeypatch, tmp_path, chat_env_key="11" * 32)
+    monkeypatch.setenv("DEGA_CHAT_IDENTITY_FILE", str(tmp_path / "missing.json"))
+    with pytest.raises(ValueError, match="selected chat identity"):
+        chat_identity.load_or_create_identity()
+
+
+def test_invalid_selected_profile_never_replaces_key(tmp_path, monkeypatch):
+    import pytest
+
+    _isolate(monkeypatch, tmp_path, chat_env_key="11" * 32)
+    profile = tmp_path / "demo.json"
+    profile.write_text(json.dumps({"secret_key_nsec": "invalid"}))
+    original = profile.read_bytes()
+    monkeypatch.setenv("DEGA_CHAT_IDENTITY_FILE", str(profile))
+    with pytest.raises(ValueError, match="invalid key"):
+        chat_identity.load_or_create_identity()
+    assert profile.read_bytes() == original

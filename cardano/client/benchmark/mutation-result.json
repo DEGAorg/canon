@@ -1,0 +1,8 @@
+{
+  "mutation": "Remove on-chain registration fee check",
+  "expected": "Missing-fee rejection test must fail",
+  "buildExit": 0,
+  "testExit": 1,
+  "caught": true,
+  "sourceRestored": true
+}

@@ -1,0 +1,23 @@
+name = "dega/registry"
+version = "0.0.0"
+compiler = "v1.1.24"
+plutus = "v3"
+license = "Apache-2.0"
+description = "Aiken contracts for project 'dega/registry'"
+
+[repository]
+user = "dega"
+project = "registry"
+platform = "github"
+
+[[dependencies]]
+name = "aiken-lang/stdlib"
+version = "v4.0.0"
+source = "github"
+
+[[dependencies]]
+name = "aiken-lang/merkle-patricia-forestry"
+version = "2.1.0"
+source = "github"
+
+[config]
