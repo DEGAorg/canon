@@ -52,5 +52,5 @@ with DEGA account integration, strategy workflows, and encrypted chat.
 Licensed under [AGPL-3.0](LICENSE).
 
 
-Cardano registration and cross-chain chat discovery are available in 0.8.0.
-See the [Cardano test setup](cardano/README.md) for the opt-in mainnet test deployment.
+Cardano registration and cross-chain chat discovery use the production registry in 0.8.1.
+See the [Cardano setup](cardano/README.md) for funding and registration instructions.

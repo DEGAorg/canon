@@ -1,5 +1,6 @@
 """Installation uses packaged sources and never modifies wallet/configuration files."""
 
+import json
 from pathlib import Path
 import subprocess
 import tomllib
@@ -196,11 +197,16 @@ def test_wheel_contains_only_explicit_client_sources(tmp_path: Path) -> None:
     artifact = next(builder.WheelBuilder(str(root)).build(directory=str(tmp_path)))
     with zipfile.ZipFile(artifact) as wheel:
         entries = set(wheel.namelist())
+        manifest = json.loads(wheel.read(
+            "toad/extensions/dega_panel/cardano_client/deployments/mainnet.json"
+        ))
+        assert manifest == json.loads((root / "cardano/deployments/mainnet.json").read_text())
     prefix = "toad/extensions/dega_panel/cardano_client/"
     client_entries = {entry for entry in entries if entry.startswith(prefix)}
     assert client_entries == set(includes.values())
     assert prefix + "package-lock.json" in entries
     assert prefix + "src/cli.ts" in entries
+    assert prefix + "deployments/mainnet.json" in entries
     assert "toad/cardano_install.py" in entries
 
 
